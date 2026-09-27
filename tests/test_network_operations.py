@@ -36,6 +36,14 @@ def app_payload(**overrides):
     return payload
 
 
+def entitlement_window():
+    now = datetime.now(UTC)
+    return {
+        "valid_from": (now - timedelta(days=1)).isoformat(),
+        "valid_until": (now + timedelta(days=1)).isoformat(),
+    }
+
+
 def sample_payload(**overrides):
     payload = {
         "sample_key": "sample-000001",
@@ -111,8 +119,7 @@ def test_acceleration_requires_entitlement_and_releases_capacity(client):
             "subscriber_hash": sample_payload()["subscriber_hash"],
             "scenario_code": "gdh-rail",
             "product_code": "rail-boost-day",
-            "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            **entitlement_window(),
             "source_order_id": "order-000001",
         },
     )
@@ -140,8 +147,7 @@ def test_expired_session_reopens_incident_with_fixed_clock(client):
             "subscriber_hash": sample_payload()["subscriber_hash"],
             "scenario_code": "gdh-rail",
             "product_code": "rail-boost-day",
-            "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            **entitlement_window(),
             "source_order_id": "order-000002",
         },
     )
@@ -171,8 +177,7 @@ def test_capacity_limit_rejects_second_session(client):
                 "subscriber_hash": subscriber,
                 "scenario_code": "gdh-rail",
                 "product_code": "rail-boost-day",
-                "valid_from": "2026-09-26T00:00:00Z",
-                "valid_until": "2026-09-27T00:00:00Z",
+                **entitlement_window(),
                 "source_order_id": f"order-capacity-{index:03d}",
             },
         )

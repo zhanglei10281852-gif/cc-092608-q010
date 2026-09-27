@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -54,14 +55,15 @@ def command_network_demo() -> int:
             print(seeded.text)
             return 1
         now = "2026-09-26T05:30:00Z"
+        window = datetime.now(UTC)
         entitlement = client.post(
             "/api/network/entitlements",
             json={
                 "subscriber_hash": "subscriber-demo-0000000001",
                 "scenario_code": "gdh-rail",
                 "product_code": "rail-boost-day",
-                "valid_from": "2026-09-26T00:00:00Z",
-                "valid_until": "2026-09-27T00:00:00Z",
+                "valid_from": (window - timedelta(days=1)).isoformat(),
+                "valid_until": (window + timedelta(days=1)).isoformat(),
                 "source_order_id": "demo-order-000001",
             },
         )

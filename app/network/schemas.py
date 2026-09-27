@@ -86,3 +86,21 @@ class BatchSamples(BaseModel):
         if len(keys) != len(set(keys)):
             raise ValueError("同一批次内 sample_key 不能重复")
         return self
+
+
+class ClusterMerge(BaseModel):
+    target_cluster_id: int = Field(ge=1)
+    source_cluster_id: int = Field(ge=1)
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ClusterSplit(BaseModel):
+    incident_ids: list[int] = Field(min_length=1, max_length=500)
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ClusterRestore(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(default="", max_length=500)

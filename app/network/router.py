@@ -4,7 +4,7 @@ from fastapi import APIRouter, Query
 
 from app.database import get_connection
 from app.network.analytics import NetworkAnalytics, ReportWindow
-from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish
+from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, ClusterMerge, ClusterRestore, ClusterSplit, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish
 from app.network.service import NetworkAccelerationService
 
 router = APIRouter(prefix="/api/network", tags=["5G-A 场景加速"])
@@ -72,6 +72,36 @@ def open_incidents(scenario_code: str | None = None, limit: int = Query(default=
 @router.post("/incidents/{incident_id}/accelerate")
 def start_acceleration(incident_id: int, payload: AccelerationStart):
     return service().start_acceleration(incident_id, payload.actor)
+
+
+@router.get("/clusters")
+def list_clusters(scenario_code: str | None = None, state: str | None = None, subscriber_hash: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": service().list_clusters(scenario_code, state, subscriber_hash, limit)}
+
+
+@router.post("/clusters/merge")
+def merge_clusters(payload: ClusterMerge):
+    return service().merge_clusters(payload.target_cluster_id, payload.source_cluster_id, payload.actor, payload.reason)
+
+
+@router.get("/clusters/{cluster_id}")
+def cluster_detail(cluster_id: int):
+    return service().cluster_detail(cluster_id)
+
+
+@router.post("/clusters/{cluster_id}/accelerate")
+def accelerate_cluster(cluster_id: int, payload: AccelerationStart):
+    return service().accelerate_cluster(cluster_id, payload.actor)
+
+
+@router.post("/clusters/{cluster_id}/split")
+def split_cluster(cluster_id: int, payload: ClusterSplit):
+    return service().split_cluster(cluster_id, payload.incident_ids, payload.actor, payload.reason)
+
+
+@router.post("/clusters/{cluster_id}/restore")
+def restore_cluster(cluster_id: int, payload: ClusterRestore):
+    return service().restore_cluster(cluster_id, payload.actor, payload.reason)
 
 
 @router.get("/sessions/{session_id}")

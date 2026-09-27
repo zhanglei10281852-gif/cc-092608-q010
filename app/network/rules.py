@@ -7,6 +7,12 @@ from app.core.errors import ValidationError
 from app.core.security import request_fingerprint
 from app.network.types import Allocation, QualityDecision
 
+DEFAULT_CORRELATION: dict[str, int] = {
+    "window_seconds": 600,
+    "grace_seconds": 300,
+    "segment_hops": 1,
+}
+
 DEFAULT_RULES: dict[str, Any] = {
     "score": {
         "latency_weight": 0.35,
@@ -24,6 +30,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "max_downlink_mbps": 200.0,
         "max_uplink_mbps": 50.0,
     },
+    "correlation": dict(DEFAULT_CORRELATION),
 }
 
 
@@ -54,6 +61,31 @@ def validate_rules(rules: dict[str, Any]) -> None:
     duration = allocation.get("duration_seconds")
     if not isinstance(duration, int) or not 30 <= duration <= 3600:
         raise ValidationError("加速时长必须在 30 到 3600 秒之间")
+    correlation = rules.get("correlation")
+    if correlation is not None:
+        if not isinstance(correlation, dict):
+            raise ValidationError("correlation 必须是对象")
+        window = correlation.get("window_seconds", DEFAULT_CORRELATION["window_seconds"])
+        if not isinstance(window, int) or not 30 <= window <= 86_400:
+            raise ValidationError("关联时间窗必须在 30 到 86400 秒之间")
+        grace = correlation.get("grace_seconds", DEFAULT_CORRELATION["grace_seconds"])
+        if not isinstance(grace, int) or not 0 <= grace <= 86_400:
+            raise ValidationError("宽限期必须在 0 到 86400 秒之间")
+        hops = correlation.get("segment_hops", DEFAULT_CORRELATION["segment_hops"])
+        if not isinstance(hops, int) or not 0 <= hops <= 10:
+            raise ValidationError("相邻区段跳数必须在 0 到 10 之间")
+
+
+def correlation_config(rules: dict[str, Any]) -> dict[str, int]:
+    """读取策略中的事件关联配置，缺失时回落到默认值。"""
+    raw = rules.get("correlation")
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "window_seconds": int(raw.get("window_seconds", DEFAULT_CORRELATION["window_seconds"])),
+        "grace_seconds": int(raw.get("grace_seconds", DEFAULT_CORRELATION["grace_seconds"])),
+        "segment_hops": int(raw.get("segment_hops", DEFAULT_CORRELATION["segment_hops"])),
+    }
 
 
 def judge_quality(sample: dict[str, Any], profile: dict[str, Any], rules: dict[str, Any]) -> QualityDecision:

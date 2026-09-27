@@ -107,6 +107,111 @@ class NetworkRepository:
     def incident_by_id(self, incident_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM quality_incidents WHERE id=?", (incident_id,)).fetchone()
 
+    def cluster_by_id(self, cluster_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM incident_clusters WHERE id=?", (cluster_id,)).fetchone()
+
+    def correlation_candidates(self, subscriber_hash: str, app_id: int, scenario_id: int, observed_at: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM incident_clusters WHERE subscriber_hash=? AND app_id=? AND scenario_id=? "
+            "AND (state IN ('open','accelerating') OR (state='resolved' AND grace_until IS NOT NULL AND grace_until>=?)) "
+            "ORDER BY id",
+            (subscriber_hash, app_id, scenario_id, observed_at),
+        ).fetchall()
+
+    def cluster_members_near(self, cluster_id: int, lower: str, upper: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT g.sequence_no FROM quality_incidents i "
+            "JOIN experience_samples s ON s.id=i.sample_id "
+            "LEFT JOIN network_segments g ON g.id=i.segment_id "
+            "WHERE i.cluster_id=? AND s.observed_at>=? AND s.observed_at<=?",
+            (cluster_id, lower, upper),
+        ).fetchall()
+
+    def cluster_member_segments(self, cluster_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT DISTINCT g.sequence_no FROM quality_incidents i "
+            "LEFT JOIN network_segments g ON g.id=i.segment_id WHERE i.cluster_id=?",
+            (cluster_id,),
+        ).fetchall()
+
+    def cluster_incident_ids(self, cluster_id: int) -> list[int]:
+        rows = self.connection.execute(
+            "SELECT id FROM quality_incidents WHERE cluster_id=? ORDER BY id",
+            (cluster_id,),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def cluster_members(self, cluster_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT i.id AS incident_id,i.severity,i.reasons_json,i.state AS incident_state,i.opened_at,"
+            "s.id AS sample_id,s.sample_key,s.observed_at,s.received_at,s.device_class,s.train_speed_kmh,"
+            "s.latency_ms,s.packet_loss,s.downlink_mbps,s.uplink_mbps,g.code AS segment_code,g.sequence_no "
+            "FROM quality_incidents i JOIN experience_samples s ON s.id=i.sample_id "
+            "LEFT JOIN network_segments g ON g.id=i.segment_id "
+            "WHERE i.cluster_id=? ORDER BY s.observed_at,i.id",
+            (cluster_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["reasons"] = json.loads(item.pop("reasons_json"))
+            result.append(item)
+        return result
+
+    def cluster_events(self, cluster_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM cluster_events WHERE cluster_id=? ORDER BY id",
+            (cluster_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json"))
+            result.append(item)
+        return result
+
+    def list_clusters(
+        self,
+        *,
+        cluster_id: int | None = None,
+        scenario_id: int | None = None,
+        state: str | None = None,
+        subscriber_hash: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if cluster_id is not None:
+            clauses.append("c.id=?")
+            params.append(cluster_id)
+        if scenario_id is not None:
+            clauses.append("c.scenario_id=?")
+            params.append(scenario_id)
+        if state:
+            clauses.append("c.state=?")
+            params.append(state)
+        if subscriber_hash:
+            clauses.append("c.subscriber_hash=?")
+            params.append(subscriber_hash)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT c.*,a.app_code,n.code AS scenario_code,"
+            "(SELECT GROUP_CONCAT(DISTINCT g.code) FROM quality_incidents i "
+            " JOIN network_segments g ON g.id=i.segment_id WHERE i.cluster_id=c.id) AS segment_codes,"
+            "(SELECT id FROM acceleration_sessions s WHERE s.cluster_id=c.id AND s.status='active') AS active_session_id "
+            "FROM incident_clusters c "
+            "JOIN application_profiles a ON a.id=c.app_id "
+            "JOIN network_scenarios n ON n.id=c.scenario_id" + where + " ORDER BY c.id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_session_by_cluster(self, cluster_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM acceleration_sessions WHERE cluster_id=? AND status='active' ORDER BY id DESC LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+
     def open_incidents(self, scenario_id: int | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT * FROM quality_incidents WHERE state IN ('open','accelerating')"
         params: list[Any] = []
@@ -164,11 +269,13 @@ class NetworkRepository:
         scenarios = self.connection.execute("SELECT status,COUNT(*) FROM network_scenarios GROUP BY status").fetchall()
         incidents = self.connection.execute("SELECT state,COUNT(*) FROM quality_incidents GROUP BY state").fetchall()
         sessions = self.connection.execute("SELECT status,COUNT(*) FROM acceleration_sessions GROUP BY status").fetchall()
+        clusters = self.connection.execute("SELECT state,COUNT(*) FROM incident_clusters GROUP BY state").fetchall()
         samples = int(self.connection.execute("SELECT COUNT(*) FROM experience_samples").fetchone()[0])
         return {
             "scenarios": {row[0]: row[1] for row in scenarios},
             "incidents": {row[0]: row[1] for row in incidents},
             "sessions": {row[0]: row[1] for row in sessions},
+            "clusters": {row[0]: row[1] for row in clusters},
             "samples": samples,
         }
 
