@@ -4,7 +4,8 @@ from fastapi import APIRouter, Query
 
 from app.database import get_connection
 from app.network.analytics import NetworkAnalytics, ReportWindow
-from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish
+from app.network.cluster_service import NetworkClusterService
+from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, ClusterMerge, ClusterRevert, ClusterSettingsUpdate, ClusterSplit, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish
 from app.network.service import NetworkAccelerationService
 
 router = APIRouter(prefix="/api/network", tags=["5G-A 场景加速"])
@@ -12,6 +13,10 @@ router = APIRouter(prefix="/api/network", tags=["5G-A 场景加速"])
 
 def service() -> NetworkAccelerationService:
     return NetworkAccelerationService()
+
+
+def cluster_service() -> NetworkClusterService:
+    return NetworkClusterService()
 
 
 @router.post("/scenarios", status_code=201)
@@ -67,6 +72,56 @@ def ingest_batch(payload: BatchSamples):
 @router.get("/incidents")
 def open_incidents(scenario_code: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
     return {"items": service().open_incidents(scenario_code, limit)}
+
+
+@router.get("/clusters/settings")
+def cluster_settings():
+    return cluster_service().get_settings()
+
+
+@router.put("/clusters/settings")
+def update_cluster_settings(payload: ClusterSettingsUpdate):
+    return cluster_service().update_settings(payload.merge_interval_seconds, payload.resolved_grace_seconds, payload.actor)
+
+
+@router.get("/clusters")
+def list_clusters(
+    scenario_code: str | None = None,
+    state: str | None = None,
+    subscriber_hash: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"items": cluster_service().list_clusters(scenario_code, state, subscriber_hash, limit)}
+
+
+@router.post("/clusters/merge")
+def merge_clusters(payload: ClusterMerge):
+    return cluster_service().merge_clusters(payload.source_cluster_id, payload.target_cluster_id, payload.actor, payload.reason)
+
+
+@router.post("/clusters/sweep")
+def sweep_clusters(actor: str = Query(default="cluster-sweeper", min_length=1)):
+    return cluster_service().close_stale_clusters(actor)
+
+
+@router.post("/clusters/history/{history_id}/revert")
+def revert_cluster_history(history_id: int, payload: ClusterRevert):
+    return cluster_service().revert_history(history_id, payload.actor)
+
+
+@router.get("/clusters/{cluster_id}")
+def cluster_detail(cluster_id: int):
+    return cluster_service().cluster_detail(cluster_id)
+
+
+@router.get("/clusters/{cluster_id}/history")
+def cluster_history(cluster_id: int):
+    return {"items": cluster_service().cluster_history(cluster_id)}
+
+
+@router.post("/clusters/{cluster_id}/split")
+def split_cluster(cluster_id: int, payload: ClusterSplit):
+    return cluster_service().split_cluster(cluster_id, payload.incident_ids, payload.actor, payload.reason)
 
 
 @router.post("/incidents/{incident_id}/accelerate")

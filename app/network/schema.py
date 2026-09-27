@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS quality_incidents (
     scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
     segment_id INTEGER REFERENCES network_segments(id),
     app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    cluster_id INTEGER REFERENCES incident_clusters(id),
     severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
     reasons_json TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','resolved','expired')),
@@ -92,6 +93,42 @@ CREATE TABLE IF NOT EXISTS quality_incidents (
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_open ON quality_incidents(state,severity,opened_at);
+CREATE TABLE IF NOT EXISTS incident_clusters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscriber_hash TEXT NOT NULL,
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+    app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','resolved','closed','merged_away')),
+    peak_severity TEXT NOT NULL CHECK(peak_severity IN ('minor','major','critical')),
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    last_received_at TEXT NOT NULL,
+    acceleration_applied INTEGER NOT NULL DEFAULT 0 CHECK(acceleration_applied IN (0,1)),
+    resolved_at TEXT,
+    closed_at TEXT,
+    merged_into INTEGER REFERENCES incident_clusters(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clusters_identity ON incident_clusters(subscriber_hash,scenario_id,app_id,state,last_observed_at);
+CREATE TABLE IF NOT EXISTS incident_cluster_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id INTEGER NOT NULL REFERENCES incident_clusters(id),
+    action TEXT NOT NULL CHECK(action IN ('created','joined','auto_merge','manual_merge','manual_split','reverted','acceleration_applied','acceleration_skipped','resolved','reopened','closed')),
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    reverted_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_history_cluster ON incident_cluster_history(cluster_id,id);
+CREATE TABLE IF NOT EXISTS cluster_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    merge_interval_seconds INTEGER NOT NULL,
+    resolved_grace_seconds INTEGER NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS acceleration_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER NOT NULL REFERENCES quality_incidents(id),
@@ -204,3 +241,8 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    # 兼容已有数据库：为质差事件补充故障簇外键
+    incident_columns = {row[1] for row in connection.execute("PRAGMA table_info(quality_incidents)")}
+    if "cluster_id" not in incident_columns:
+        connection.execute("ALTER TABLE quality_incidents ADD COLUMN cluster_id INTEGER REFERENCES incident_clusters(id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_incidents_cluster ON quality_incidents(cluster_id)")

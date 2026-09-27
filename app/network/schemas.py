@@ -86,3 +86,32 @@ class BatchSamples(BaseModel):
         if len(keys) != len(set(keys)):
             raise ValueError("同一批次内 sample_key 不能重复")
         return self
+
+
+class ClusterSettingsUpdate(BaseModel):
+    merge_interval_seconds: int = Field(ge=10, le=3600)
+    resolved_grace_seconds: int = Field(ge=0, le=86400)
+    actor: str = Field(min_length=1, max_length=120)
+
+
+class ClusterMerge(BaseModel):
+    source_cluster_id: int = Field(gt=0)
+    target_cluster_id: int = Field(gt=0)
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(default="", max_length=500)
+
+
+class ClusterSplit(BaseModel):
+    incident_ids: list[int] = Field(min_length=1, max_length=500)
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def unique_incidents(self) -> "ClusterSplit":
+        if len(self.incident_ids) != len(set(self.incident_ids)):
+            raise ValueError("拆分事件不能重复")
+        return self
+
+
+class ClusterRevert(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)

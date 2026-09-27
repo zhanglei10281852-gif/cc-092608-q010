@@ -120,6 +120,116 @@ class NetworkRepository:
     def session_by_incident(self, incident_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM acceleration_sessions WHERE incident_id=?", (incident_id,)).fetchone()
 
+    def cluster_by_id(self, cluster_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM incident_clusters WHERE id=?", (cluster_id,)).fetchone()
+
+    def cluster_incidents(self, cluster_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM quality_incidents WHERE cluster_id=? ORDER BY id",
+            (cluster_id,),
+        ).fetchall()
+
+    def cluster_representative_incident(self, cluster_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT i.* FROM quality_incidents i JOIN experience_samples s ON s.id=i.sample_id "
+            "WHERE i.cluster_id=? AND i.state='open' "
+            "ORDER BY CASE i.severity WHEN 'critical' THEN 3 WHEN 'major' THEN 2 ELSE 1 END DESC,s.observed_at,i.id LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+
+    def active_session_for_cluster(self, cluster_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT s.* FROM acceleration_sessions s JOIN quality_incidents i ON i.id=s.incident_id "
+            "WHERE i.cluster_id=? AND s.status='active' ORDER BY s.id LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+
+    def cluster_candidates(self, subscriber_hash: str, scenario_id: int, app_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT c.id AS cluster_id,c.state,c.resolved_at,i.id AS incident_id,i.severity,"
+            "s.observed_at,g.sequence_no FROM incident_clusters c "
+            "JOIN quality_incidents i ON i.cluster_id=c.id "
+            "JOIN experience_samples s ON s.id=i.sample_id "
+            "LEFT JOIN network_segments g ON g.id=i.segment_id "
+            "WHERE c.subscriber_hash=? AND c.scenario_id=? AND c.app_id=? AND c.state IN ('open','accelerating','resolved') "
+            "ORDER BY c.id,i.id",
+            (subscriber_hash, scenario_id, app_id),
+        ).fetchall()
+
+    def list_clusters(
+        self,
+        *,
+        scenario_id: int | None = None,
+        state: str | None = None,
+        subscriber_hash: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scenario_id is not None:
+            clauses.append("c.scenario_id=?")
+            params.append(scenario_id)
+        if state:
+            clauses.append("c.state=?")
+            params.append(state)
+        else:
+            clauses.append("c.state<>'merged_away'")
+        if subscriber_hash:
+            clauses.append("c.subscriber_hash=?")
+            params.append(subscriber_hash)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT c.*,n.code AS scenario_code,a.app_code,"
+            "(SELECT COUNT(*) FROM quality_incidents i WHERE i.cluster_id=c.id) AS incident_count,"
+            "(SELECT COUNT(*) FROM quality_incidents i WHERE i.cluster_id=c.id AND i.state IN ('open','accelerating')) AS open_incident_count "
+            "FROM incident_clusters c JOIN network_scenarios n ON n.id=c.scenario_id "
+            "JOIN application_profiles a ON a.id=c.app_id" + where + " ORDER BY c.id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return rows_dict(rows)
+
+    def cluster_member_trajectory(self, cluster_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT i.id AS incident_id,i.severity,i.state AS incident_state,i.opened_at,i.resolved_at,i.reasons_json,"
+            "s.id AS sample_id,s.sample_key,s.observed_at,s.received_at,s.latency_ms,s.packet_loss,"
+            "s.downlink_mbps,s.uplink_mbps,s.device_class,s.train_speed_kmh,"
+            "g.code AS segment_code,g.sequence_no AS segment_sequence "
+            "FROM quality_incidents i JOIN experience_samples s ON s.id=i.sample_id "
+            "LEFT JOIN network_segments g ON g.id=i.segment_id "
+            "WHERE i.cluster_id=? ORDER BY s.observed_at,i.id",
+            (cluster_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["reasons"] = json.loads(item.pop("reasons_json"))
+            result.append(item)
+        return result
+
+    def cluster_history(self, cluster_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM incident_cluster_history WHERE cluster_id=? ORDER BY id",
+            (cluster_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json"))
+            result.append(item)
+        return result
+
+    def cluster_sessions(self, cluster_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT s.id,s.incident_id,s.status,s.allocated_downlink_mbps,s.allocated_uplink_mbps,"
+            "s.started_at,s.expires_at,s.ended_at,s.end_reason FROM acceleration_sessions s "
+            "JOIN quality_incidents i ON i.id=s.incident_id WHERE i.cluster_id=? ORDER BY s.id",
+            (cluster_id,),
+        ).fetchall()
+        return rows_dict(rows)
+
+    def cluster_settings_row(self) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM cluster_settings WHERE id=1").fetchone()
+
     def session_by_id(self, session_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM acceleration_sessions WHERE id=?", (session_id,)).fetchone()
 
@@ -164,11 +274,13 @@ class NetworkRepository:
         scenarios = self.connection.execute("SELECT status,COUNT(*) FROM network_scenarios GROUP BY status").fetchall()
         incidents = self.connection.execute("SELECT state,COUNT(*) FROM quality_incidents GROUP BY state").fetchall()
         sessions = self.connection.execute("SELECT status,COUNT(*) FROM acceleration_sessions GROUP BY status").fetchall()
+        clusters = self.connection.execute("SELECT state,COUNT(*) FROM incident_clusters GROUP BY state").fetchall()
         samples = int(self.connection.execute("SELECT COUNT(*) FROM experience_samples").fetchone()[0])
         return {
             "scenarios": {row[0]: row[1] for row in scenarios},
             "incidents": {row[0]: row[1] for row in incidents},
             "sessions": {row[0]: row[1] for row in sessions},
+            "clusters": {row[0]: row[1] for row in clusters},
             "samples": samples,
         }
 

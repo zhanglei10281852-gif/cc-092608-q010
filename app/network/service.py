@@ -9,6 +9,7 @@ from app.core.clock import Clock, SystemClock, from_storage, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import request_fingerprint
 from app.database import get_connection, transaction
+from app.network.cluster_service import NetworkClusterService, record_history
 from app.network.repository import NetworkRepository
 from app.network.rules import DEFAULT_RULES, allocation_for, canonical_rules, judge_quality
 from app.network.schema import ensure_network_schema
@@ -20,6 +21,7 @@ class NetworkAccelerationService:
         ensure_network_schema(self.connection)
         self.clock = clock or SystemClock()
         self.repository = NetworkRepository(self.connection)
+        self.clusters = NetworkClusterService(self.connection, self.clock)
 
     def create_scenario(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
@@ -122,7 +124,7 @@ class NetworkAccelerationService:
             )
             return dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
 
-    def ingest_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def ingest_sample(self, payload: dict[str, Any], *, auto_accelerate: bool = True) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
         app = self._application(payload["app_code"])
         segment = None
@@ -144,24 +146,49 @@ class NetworkAccelerationService:
         policy = self.repository.effective_policy(scenario["id"], now)
         rules = json.loads(policy["rules_json"]) if policy else DEFAULT_RULES
         decision = judge_quality(payload, dict(app), rules)
+        cluster_created = False
         with transaction(immediate=True) as connection:
             cursor = connection.execute(
                 "INSERT INTO experience_samples(sample_key,scenario_id,segment_id,app_id,subscriber_hash,device_class,train_speed_kmh,latency_ms,packet_loss,downlink_mbps,uplink_mbps,observed_at,received_at,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (payload["sample_key"], scenario["id"], segment["id"] if segment else None, app["id"], payload["subscriber_hash"], payload["device_class"], payload["train_speed_kmh"], payload["latency_ms"], payload["packet_loss"], payload["downlink_mbps"], payload["uplink_mbps"], observed, now, digest),
             )
             incident_id = None
+            cluster_id = None
             if decision.degraded:
                 incident = connection.execute(
                     "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at) VALUES(?,?,?,?,?,?,?)",
                     (cursor.lastrowid, scenario["id"], segment["id"] if segment else None, app["id"], decision.severity, json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True), now),
                 )
                 incident_id = incident.lastrowid
-            return {"sample_id": cursor.lastrowid, "incident_id": incident_id, "quality": decision.as_dict()}
+                cluster_id, cluster_created = self.clusters.assign_incident(
+                    connection,
+                    incident_id=incident_id,
+                    subscriber_hash=payload["subscriber_hash"],
+                    scenario_id=scenario["id"],
+                    app_id=app["id"],
+                    severity=decision.severity,
+                    observed_at=observed,
+                    received_at=now,
+                    segment_sequence=segment["sequence_no"] if segment else None,
+                    now=now,
+                )
+            result = {"sample_id": cursor.lastrowid, "incident_id": incident_id, "cluster_id": cluster_id, "cluster_created": cluster_created, "quality": decision.as_dict()}
+        # 新建簇在事务提交后尝试一次自动加速申请，失败不阻断采样
+        if auto_accelerate and cluster_created and cluster_id is not None:
+            self._try_auto_accelerate(cluster_id)
+        return result
 
     def ingest_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         results = []
+        created_clusters: list[int] = []
         for item in items:
-            results.append(self.ingest_sample(item))
+            result = self.ingest_sample(item, auto_accelerate=False)
+            results.append(result)
+            if result.get("cluster_created") and result.get("cluster_id") is not None:
+                created_clusters.append(result["cluster_id"])
+        # 同一批次先完成全部归并，每个最终簇只触发一次加速申请
+        for cluster_id in dict.fromkeys(created_clusters):
+            self._try_auto_accelerate(cluster_id)
         return {"items": results, "accepted": len(results)}
 
     def start_acceleration(self, incident_id: int, actor: str) -> dict[str, Any]:
@@ -171,8 +198,20 @@ class NetworkAccelerationService:
         existing = self.repository.session_by_incident(incident_id)
         if existing is not None:
             return self.repository.session_detail(existing["id"])
+        cluster = self.repository.cluster_by_id(incident["cluster_id"]) if incident["cluster_id"] else None
+        if cluster is not None:
+            if cluster["state"] == "closed":
+                raise ConflictError("故障簇已封闭，不能启动加速")
+            if cluster["state"] == "merged_away":
+                raise ConflictError("故障簇已并入其他簇，请对幸存簇发起加速")
+            active = self.repository.active_session_for_cluster(cluster["id"])
+            if active is not None:
+                return self.repository.session_detail(active["id"])
+            if cluster["acceleration_applied"]:
+                raise ConflictError("该故障簇已提交过加速申请，不能重复申请")
         if incident["state"] != "open":
             raise ConflictError("只有待处理事件可以启动加速")
+        severity = cluster["peak_severity"] if cluster is not None else incident["severity"]
         sample = self.repository.sample_by_id(incident["sample_id"])
         app = self.repository.application_by_id(incident["app_id"])
         now_value = self.clock.now()
@@ -184,7 +223,7 @@ class NetworkAccelerationService:
         if policy is None:
             raise ConflictError("场景没有已生效的加速策略")
         rules = json.loads(policy["rules_json"])
-        allocation = allocation_for(dict(app), incident["severity"], rules)
+        allocation = allocation_for(dict(app), severity, rules)
         scenario = self.repository.scenario_by_id(incident["scenario_id"])
         segment = self.repository.segment_by_id(incident["segment_id"]) if incident["segment_id"] else None
         from app.network.operations import NetworkOperationsService
@@ -207,7 +246,12 @@ class NetworkAccelerationService:
                 "INSERT INTO capacity_reservations(session_id,scenario_id,segment_id,downlink_mbps,uplink_mbps,held_at) VALUES(?,?,?,?,?,?)",
                 (cursor.lastrowid, incident["scenario_id"], incident["segment_id"], allocation.downlink_mbps, allocation.uplink_mbps, now),
             )
-            connection.execute("UPDATE quality_incidents SET state='accelerating',version=version+1 WHERE id=?", (incident_id,))
+            if cluster is not None:
+                connection.execute("UPDATE quality_incidents SET state='accelerating',version=version+1 WHERE cluster_id=? AND state='open'", (cluster["id"],))
+                connection.execute("UPDATE incident_clusters SET state='accelerating',acceleration_applied=1,updated_at=?,version=version+1 WHERE id=?", (now, cluster["id"]))
+                record_history(connection, cluster["id"], "acceleration_applied", actor, {"trigger": "manual", "session_id": cursor.lastrowid, "incident_id": incident_id}, now)
+            else:
+                connection.execute("UPDATE quality_incidents SET state='accelerating',version=version+1 WHERE id=?", (incident_id,))
             self._event(connection, cursor.lastrowid, "started", actor, {"policy_version": policy["version_no"]}, now)
             return NetworkRepository(connection).session_detail(cursor.lastrowid)
 
@@ -218,14 +262,26 @@ class NetworkAccelerationService:
         if session["status"] != "active":
             return self.repository.session_detail(session_id)
         now = to_storage(self.clock.now())
+        incident = self.repository.incident_by_id(session["incident_id"])
+        cluster_id = incident["cluster_id"] if incident else None
         with transaction(immediate=True) as connection:
             connection.execute(
                 "UPDATE acceleration_sessions SET status=?,ended_at=?,end_reason=?,version=version+1 WHERE id=? AND status='active'",
                 (result, now, reason, session_id),
             )
             connection.execute("UPDATE capacity_reservations SET state='released',released_at=? WHERE session_id=? AND state='held'", (now, session_id))
-            incident_state = "resolved" if result == "completed" else "open"
-            connection.execute("UPDATE quality_incidents SET state=?,resolved_at=?,version=version+1 WHERE id=?", (incident_state, now if result == "completed" else None, session["incident_id"]))
+            if cluster_id is not None:
+                if result == "completed":
+                    connection.execute("UPDATE quality_incidents SET state='resolved',resolved_at=?,version=version+1 WHERE cluster_id=? AND state IN ('open','accelerating')", (now, cluster_id))
+                    connection.execute("UPDATE incident_clusters SET state='resolved',resolved_at=?,updated_at=?,version=version+1 WHERE id=? AND state NOT IN ('closed','merged_away')", (now, now, cluster_id))
+                    record_history(connection, cluster_id, "resolved", actor, {"session_id": session_id, "reason": reason}, now)
+                else:
+                    connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE cluster_id=? AND state='accelerating'", (cluster_id,))
+                    connection.execute("UPDATE incident_clusters SET state='open',resolved_at=NULL,updated_at=?,version=version+1 WHERE id=? AND state='accelerating'", (now, cluster_id))
+                    record_history(connection, cluster_id, "reopened", actor, {"trigger": "session_cancelled", "session_id": session_id, "reason": reason}, now)
+            else:
+                incident_state = "resolved" if result == "completed" else "open"
+                connection.execute("UPDATE quality_incidents SET state=?,resolved_at=?,version=version+1 WHERE id=?", (incident_state, now if result == "completed" else None, session["incident_id"]))
             self._event(connection, session_id, result, actor, {"reason": reason}, now)
             return NetworkRepository(connection).session_detail(session_id)
 
@@ -240,10 +296,76 @@ class NetworkAccelerationService:
                     continue
                 connection.execute("UPDATE acceleration_sessions SET status='expired',ended_at=?,end_reason='duration_elapsed',version=version+1 WHERE id=?", (now, row["id"]))
                 connection.execute("UPDATE capacity_reservations SET state='released',released_at=? WHERE session_id=? AND state='held'", (now, row["id"]))
-                connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE id=?", (session["incident_id"],))
+                incident = NetworkRepository(connection).incident_by_id(session["incident_id"])
+                cluster_id = incident["cluster_id"] if incident else None
+                if cluster_id is not None:
+                    connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE cluster_id=? AND state='accelerating'", (cluster_id,))
+                    connection.execute("UPDATE incident_clusters SET state='open',resolved_at=NULL,updated_at=?,version=version+1 WHERE id=? AND state='accelerating'", (now, cluster_id))
+                    record_history(connection, cluster_id, "reopened", actor, {"trigger": "session_expired", "session_id": row["id"]}, now)
+                else:
+                    connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE id=?", (session["incident_id"],))
                 self._event(connection, row["id"], "expired", actor, {}, now)
                 expired.append(row["id"])
         return {"expired": expired}
+
+    def _try_auto_accelerate(self, cluster_id: int) -> None:
+        """为新建故障簇尝试一次自动加速申请；不满足条件时记录跳过原因，不抛出异常。"""
+        cluster = self.repository.cluster_by_id(cluster_id)
+        if cluster is None or cluster["state"] in ("closed", "merged_away") or cluster["acceleration_applied"]:
+            return
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        reason = None
+        policy = None
+        allocation = None
+        incident = self.repository.cluster_representative_incident(cluster_id)
+        app = self.repository.application_by_id(cluster["app_id"])
+        scenario = self.repository.scenario_by_id(cluster["scenario_id"])
+        if incident is None:
+            reason = "no_open_incident"
+        elif self.repository.active_entitlement(cluster["subscriber_hash"], cluster["scenario_id"], now) is None:
+            reason = "no_entitlement"
+        else:
+            policy = self.repository.effective_policy(cluster["scenario_id"], now)
+            if policy is None:
+                reason = "no_policy"
+        segment = None
+        if reason is None and incident["segment_id"]:
+            segment = self.repository.segment_by_id(incident["segment_id"])
+        if reason is None:
+            from app.network.operations import NetworkOperationsService
+            maintenance = NetworkOperationsService(self.connection, self.clock).blocks_new_session(cluster["scenario_id"], incident["segment_id"], now)
+            if maintenance is not None:
+                reason = "maintenance_blocked"
+        if reason is None:
+            rules = json.loads(policy["rules_json"])
+            allocation = allocation_for(dict(app), cluster["peak_severity"], rules)
+            limit = int(segment["capacity_mbps"] if segment else scenario["capacity_mbps"])
+            used = self.repository.active_capacity(cluster["scenario_id"], incident["segment_id"])
+            if used["sessions"] >= int(scenario["max_concurrent_sessions"]):
+                reason = "session_limit"
+            elif used["downlink_mbps"] + allocation.downlink_mbps > limit:
+                reason = "capacity_exceeded"
+        with transaction(immediate=True) as connection:
+            current = NetworkRepository(connection).cluster_by_id(cluster_id)
+            if current is None or current["state"] in ("closed", "merged_away") or current["acceleration_applied"]:
+                return
+            if reason is not None:
+                record_history(connection, cluster_id, "acceleration_skipped", "auto-acceleration", {"reason": reason}, now)
+                return
+            expires = to_storage(now_value + timedelta(seconds=allocation.duration_seconds))
+            cursor = connection.execute(
+                "INSERT INTO acceleration_sessions(incident_id,subscriber_hash,app_id,scenario_id,segment_id,policy_version_id,allocated_downlink_mbps,allocated_uplink_mbps,priority,started_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (incident["id"], cluster["subscriber_hash"], cluster["app_id"], cluster["scenario_id"], incident["segment_id"], policy["id"], allocation.downlink_mbps, allocation.uplink_mbps, allocation.priority, now, expires),
+            )
+            connection.execute(
+                "INSERT INTO capacity_reservations(session_id,scenario_id,segment_id,downlink_mbps,uplink_mbps,held_at) VALUES(?,?,?,?,?,?)",
+                (cursor.lastrowid, cluster["scenario_id"], incident["segment_id"], allocation.downlink_mbps, allocation.uplink_mbps, now),
+            )
+            connection.execute("UPDATE quality_incidents SET state='accelerating',version=version+1 WHERE cluster_id=? AND state='open'", (cluster_id,))
+            connection.execute("UPDATE incident_clusters SET state='accelerating',acceleration_applied=1,updated_at=?,version=version+1 WHERE id=?", (now, cluster_id))
+            self._event(connection, cursor.lastrowid, "started", "auto-acceleration", {"policy_version": policy["version_no"], "cluster_id": cluster_id, "trigger": "auto"}, now)
+            record_history(connection, cluster_id, "acceleration_applied", "auto-acceleration", {"trigger": "auto", "session_id": cursor.lastrowid, "incident_id": incident["id"]}, now)
 
     def open_incidents(self, scenario_code: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None
@@ -274,7 +396,14 @@ class NetworkAccelerationService:
     def _sample_result(self, sample_id: int) -> dict[str, Any]:
         sample = self.repository.sample_by_id(sample_id)
         incident = self.repository.incident_by_sample(sample_id)
-        return {"sample_id": sample_id, "incident_id": incident["id"] if incident else None, "duplicate": True, "sample": dict(sample)}
+        return {
+            "sample_id": sample_id,
+            "incident_id": incident["id"] if incident else None,
+            "cluster_id": incident["cluster_id"] if incident else None,
+            "cluster_created": False,
+            "duplicate": True,
+            "sample": dict(sample),
+        }
 
     def _scenario(self, code: str) -> sqlite3.Row:
         row = self.repository.scenario_by_code(code)
